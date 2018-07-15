@@ -80,6 +80,9 @@ const  unsigned long PULSE_MAX_DURATION = 50;
 #define REG_SYNCVALUE1      0x2F
 boolean RF_STATUS;
 
+#ifndef EXTERNAL_SENSORS
+#define EXTERNAL_SENSORS 1
+#endif
 
 byte RF_freq=RF12_433MHZ;                                           // Frequency of RF12B module can be RF12_433MHZ, RF12_868MHZ or RF12_915MHZ. You should use the one matching the module you have.
 byte nodeID = 23;                                                      // EmonTH temperature RFM12B node ID - should be unique on network
@@ -122,7 +125,7 @@ boolean DS18B20;                                                      // create 
 // https://github.com/openenergymonitor/emonhub/blob/emon-pi/configuration.md
 typedef struct {                                                      // RFM RF payload datastructure
   int temp;
-  int temp_external;
+  int temp_external[EXTERNAL_SENSORS];
   int humidity;
   int battery;
   unsigned long pulsecount;
@@ -131,7 +134,7 @@ Payload emonth;
 
 int numSensors;
 //addresses of sensors, MAX 4!!
-byte allAddress [4][8];                                              // 8 bytes per address
+byte allAddress [EXTERNAL_SENSORS][8];        // 8 bytes per address
 
 volatile unsigned long pulseCount;
 unsigned long WDT_number;
@@ -273,10 +276,11 @@ void setup() {
   digitalWrite(DS18B20_PWR, HIGH); delay(50);
   sensors.begin();
   sensors.setWaitForConversion(false);                             //disable automatic temperature conversion to reduce time spent awake, conversion will be implemented manually in sleeping http://harizanov.com/2013/07/optimizing-ds18b20-code-for-low-power-applications/
-  numSensors=(sensors.getDeviceCount());
-  byte j=0;                                        // search for one wire devices and
-                                                   // copy to device address arrays.
-  while ((j < numSensors) && (oneWire.search(allAddress[j])))  j++;
+  numSensors = min(sensors.getDeviceCount(), EXTERNAL_SENSORS);
+  // search for one wire devices and copy to device address arrays.
+  for(byte j=0; j < numSensors; j++) {
+    sensors.getAddress(allAddress[j], j);
+  }
   digitalWrite(DS18B20_PWR, LOW);
 
   if (numSensors==0)
@@ -373,15 +377,47 @@ void loop()
     if (DS18B20==1)
     {
       digitalWrite(DS18B20_PWR, HIGH); dodelay(50);
-      for(int j=0;j<numSensors;j++) sensors.setResolution(allAddress[j], TEMPERATURE_PRECISION);      // and set the a to d conversion resolution of each.
-      sensors.requestTemperatures();                                        // Send the command to get temperatures
-      dodelay(ASYNC_DELAY); //Must wait for conversion, since we use ASYNC mode
-      float temp=(sensors.getTempC(allAddress[0]));
-      digitalWrite(DS18B20_PWR, LOW);
-      if ((temp<125.0) && (temp>-40.0))
-      {
-        emonth.temp_external=(temp*10);
+      sensors.begin();
+      numSensors = min(sensors.getDeviceCount(), EXTERNAL_SENSORS);
+      // search for one wire devices and copy to device address arrays.
+      for(byte j=0; (j < numSensors) && (sensors.getAddress(allAddress[j], j)); j++) {
+        sensors.setResolution(allAddress[j], TEMPERATURE_PRECISION);      // and set the a to d conversion resolution of each.
       }
+
+      sensors.requestTemperatures();                                        // Send the command to get temperatures
+
+      // Wait for all sensors to be ready
+      int count;
+      for(count = 0; count < 30; count++) 
+      {
+        dodelay(25);
+        int numReady = 0;
+        for(int j=0; j < numSensors; j++) 
+        {
+          oneWire.select(allAddress[j]);
+          if(sensors.isConversionComplete()) {
+            numReady++;
+          } else {
+            break;
+          }
+        }
+        if(numReady == numSensors) {
+          break;
+        }
+      }
+      //dodelay(ASYNC_DELAY); //Must wait for conversion, since we use ASYNC mode
+
+      for(int j=0; j < numSensors && j < EXTERNAL_SENSORS; j++)
+      {
+        sensors.requestTemperaturesByAddress(allAddress[j]);
+        float temp=(sensors.getTempC(allAddress[j]));
+        //for(int i = 0; i < 8; i++){Serial.print(allAddress[j][i], HEX);} Serial.print(" = "); Serial.println(temp);
+        if ((temp<125.0) && (temp>-40.0)) {
+          emonth.temp_external[j]=(temp*10);
+        }
+      }
+
+      digitalWrite(DS18B20_PWR, LOW);
     }
 
     emonth.battery=int(analogRead(BATT_ADC)*0.0322);                    //read battery voltage, convert ADC to volts x10
@@ -434,8 +470,15 @@ void loop()
     {
       Serial.print("temp:");Serial.print(emonth.temp); Serial.print(",");
 
-      if (DS18B20){
-        Serial.print("tempex:");Serial.print(emonth.temp_external); Serial.print(",");
+      if (DS18B20)
+      {
+        #if 1 == EXTERNAL_SENSORS
+        Serial.print("tempex:");Serial.print(emonth.temp_external[0]); Serial.print(",");
+        #else        
+        for(int j=0; j < numSensors && j < EXTERNAL_SENSORS; j++) {
+          Serial.print("tempex"); Serial.print(j); Serial.print(":"); Serial.print(emonth.temp_external[j]); Serial.print(",");
+        }
+        #endif
       }
 
       if (SI7021_status){
